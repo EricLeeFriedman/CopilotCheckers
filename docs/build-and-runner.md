@@ -11,6 +11,7 @@ That build script does not exist yet because this bootstrap commit intentionally
 The repository currently includes:
 
 - `copilot-setup-steps.yml` to prepare the Copilot cloud-agent environment
+- `assign-next-issue.yml` to assign the next eligible open issue to Copilot when no pull request is open
 - `pr-review.yml` to run automated pull request review
 - `retrospective.yml` to analyze high-churn pull requests
 - `validate-pr-review.yml` to test PR review parsing and routing logic offline
@@ -41,3 +42,18 @@ The review and retrospective workflows expect a fine-grained personal access tok
 - `PERSONAL_ACCESS_TOKEN`
 
 That token must belong to a GitHub user with Copilot access and include the **Copilot Requests** permission.
+
+The issue-assignment workflow expects a user token stored as either:
+
+- `COPILOT_ASSIGN_TOKEN`
+- `PERSONAL_ACCESS_TOKEN`
+
+For a fine-grained personal access token, GitHub's documented minimum is:
+
+- metadata: read
+- actions: read/write
+- contents: read/write
+- issues: read/write
+- pull requests: read/write
+
+The assignment workflow is currently intended for manual dispatch. The cron trigger is scaffolded but intentionally disabled.

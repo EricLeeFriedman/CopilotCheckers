@@ -1,0 +1,240 @@
+name: Assign Next Issue To Copilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: Branch Copilot should branch from
+        required: false
+        default: main
+        type: string
+      custom_agent:
+        description: Optional custom agent slug or identifier
+        required: false
+        default: ""
+        type: string
+      model:
+        description: Optional model identifier
+        required: false
+        default: ""
+        type: string
+      custom_instructions:
+        description: Optional extra instructions to add at assignment time
+        required: false
+        default: ""
+        type: string
+      issue_label:
+        description: Optional label filter for eligible issues
+        required: false
+        default: ""
+        type: string
+
+  # Intentionally not enabled yet.
+  # schedule:
+  #   - cron: "0 * * * *"
+
+concurrency:
+  group: assign-next-issue
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    env:
+      REPOSITORY: ${{ github.repository }}
+      BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
+      CUSTOM_AGENT: ${{ inputs.custom_agent }}
+      MODEL: ${{ inputs.model }}
+      CUSTOM_INSTRUCTIONS: ${{ inputs.custom_instructions }}
+      ISSUE_LABEL: ${{ inputs.issue_label }}
+      COPILOT_ASSIGN_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN || secrets.PERSONAL_ACCESS_TOKEN }}
+    steps:
+      - name: Assign next issue
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          GITHUB_API = "https://api.github.com/graphql"
+          COPILOT_LOGIN = "copilot-swe-agent"
+
+          token = os.environ.get("COPILOT_ASSIGN_TOKEN", "").strip()
+          repo_name = os.environ["REPOSITORY"]
+          base_branch = os.environ.get("BASE_BRANCH", "main").strip() or "main"
+          custom_agent = os.environ.get("CUSTOM_AGENT", "").strip()
+          model = os.environ.get("MODEL", "").strip()
+          custom_instructions = os.environ.get("CUSTOM_INSTRUCTIONS", "").strip()
+          issue_label = os.environ.get("ISSUE_LABEL", "").strip()
+
+          if not token:
+              raise SystemExit(
+                  "Missing COPILOT_ASSIGN_TOKEN or PERSONAL_ACCESS_TOKEN. "
+                  "Use a user token with metadata:read plus read/write access to actions, contents, "
+                  "issues, and pull requests."
+              )
+
+          owner, repo = repo_name.split("/", 1)
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "Content-Type": "application/json",
+              "GraphQL-Features": "issues_copilot_assignment_api_support,coding_agent_model_selection",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "CopilotCheckers-assign-next-issue",
+          }
+
+          def graphql(query, variables=None):
+              payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+              request = urllib.request.Request(GITHUB_API, data=payload, headers=headers, method="POST")
+              with urllib.request.urlopen(request) as response:
+                  body = json.loads(response.read())
+              if "errors" in body:
+                  raise RuntimeError(json.dumps(body["errors"], indent=2))
+              return body["data"]
+
+          repo_query = """
+          query RepoData($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+              id
+              pullRequests(states: OPEN, first: 1) {
+                nodes {
+                  number
+                  title
+                }
+              }
+              suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+                nodes {
+                  __typename
+                  login
+                  ... on Bot {
+                    id
+                  }
+                  ... on User {
+                    id
+                  }
+                }
+              }
+              issues(states: OPEN, first: 100) {
+                nodes {
+                  id
+                  number
+                  title
+                  labels(first: 20) {
+                    nodes {
+                      name
+                    }
+                  }
+                  assignees(first: 20) {
+                    nodes {
+                      login
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
+
+          repo_data = graphql(repo_query, {"owner": owner, "repo": repo})["repository"]
+          open_prs = repo_data["pullRequests"]["nodes"]
+          if open_prs:
+              open_pr = open_prs[0]
+              print(
+                  f"Skipping assignment because PR #{open_pr['number']} is open: "
+                  f"{open_pr['title']}"
+              )
+              sys.exit(0)
+
+          copilot_actor = None
+          for actor in repo_data["suggestedActors"]["nodes"]:
+              if actor.get("login") == COPILOT_LOGIN:
+                  copilot_actor = actor
+                  break
+
+          if not copilot_actor:
+              raise SystemExit(
+                  "Copilot cloud agent is not available as an assignable actor in this repository."
+              )
+
+          issues = []
+          for issue in repo_data["issues"]["nodes"]:
+              assignees = [node["login"] for node in issue["assignees"]["nodes"]]
+              labels = [node["name"] for node in issue["labels"]["nodes"]]
+              if assignees:
+                  continue
+              if issue_label and issue_label not in labels:
+                  continue
+              issues.append(issue)
+
+          if not issues:
+              print("No eligible open issues found.")
+              sys.exit(0)
+
+          issues.sort(key=lambda issue: issue["number"])
+          selected = issues[0]
+
+          agent_assignment = {
+              "targetRepositoryId": repo_data["id"],
+              "baseRef": base_branch,
+          }
+          if custom_instructions:
+              agent_assignment["customInstructions"] = custom_instructions
+          if custom_agent:
+              agent_assignment["customAgent"] = custom_agent
+          if model:
+              agent_assignment["model"] = model
+
+          assign_mutation = """
+          mutation AssignIssue(
+            $assignableId: ID!,
+            $actorIds: [ID!]!,
+            $agentAssignment: AgentAssignmentInput!
+          ) {
+            replaceActorsForAssignable(
+              input: {
+                assignableId: $assignableId,
+                actorIds: $actorIds,
+                agentAssignment: $agentAssignment
+              }
+            ) {
+              assignable {
+                ... on Issue {
+                  id
+                  number
+                  title
+                  assignees(first: 10) {
+                    nodes {
+                      login
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
+
+          result = graphql(
+              assign_mutation,
+              {
+                  "assignableId": selected["id"],
+                  "actorIds": [copilot_actor["id"]],
+                  "agentAssignment": agent_assignment,
+              },
+          )["replaceActorsForAssignable"]["assignable"]
+
+          print(
+              f"Assigned issue #{result['number']} to Copilot: {result['title']}"
+          )
+          print(
+              "Assignees: "
+              + ", ".join(node["login"] for node in result["assignees"]["nodes"])
+          )
+          PYEOF
