@@ -1,0 +1,77 @@
+name: Feature
+description: Capture a design-and-implementation task for the checkers application.
+title: "[Feature]: "
+labels:
+  - feature
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the outcome this task should deliver.
+    validations:
+      required: true
+
+  - type: textarea
+    id: player_behavior
+    attributes:
+      label: Player-facing behavior
+      description: Explain what a player should be able to do or observe when this task is complete.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints touched
+      options:
+        - label: Win32 platform boundary
+        - label: 2D software rendering
+        - label: Game rules or move legality
+        - label: Mouse input or drag-and-drop
+        - label: Memory arenas or allocation policy
+        - label: In-application testing
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Write the specific conditions that must be true for this task to be done.
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation expectations
+      description: Describe the test mode, manual checks, or observable evidence expected for completion.
+    validations:
+      required: true
+
+  - type: textarea
+    id: failure_paths
+    attributes:
+      label: Failure paths and lifecycle edges
+      description: |
+        List error cases, shutdown paths, or asymmetric behavior that must be handled.
+        Examples: arena exhaustion, init returning false vs crashing, restart after a decided game.
+    validations:
+      required: true
+
+  - type: textarea
+    id: rule_surfaces
+    attributes:
+      label: Rule surfaces affected
+      description: |
+        If this task changes gameplay rules, list the specific rule surfaces involved.
+        Leave blank for non-gameplay tasks.
+
+  - type: textarea
+    id: docs
+    attributes:
+      label: Doc ownership
+      description: |
+        Using the doc ownership map in AGENTS.md, list which docs must be updated and why.
+        If no rows apply, state that explicitly.
+    validations:
+      required: true

@@ -1,0 +1,416 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "src/**"
+      - "build.ps1"
+      - "docs/**"
+      - ".github/**"
+      - "AGENTS.md"
+      - "README.md"
+      - "InitialPrompt.md"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Classify PR
+        id: classify_pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          GITHUB_API = "https://api.github.com"
+
+          token = os.environ["GITHUB_TOKEN"]
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+
+          def gh_get_paged(path):
+              results = []
+              page = 1
+              while True:
+                  sep = "&" if "?" in path else "?"
+                  req = urllib.request.Request(
+                      f"{GITHUB_API}{path}{sep}per_page=100&page={page}",
+                      headers={
+                          "Authorization": f"Bearer {token}",
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urllib.request.urlopen(req) as response:
+                      page_data = json.loads(response.read())
+                  if not page_data:
+                      break
+                  results.extend(page_data)
+                  if len(page_data) < 100:
+                      break
+                  page += 1
+              return results
+
+          files = gh_get_paged(f"/repos/{repo}/pulls/{pr_number}/files")
+          changed_paths = [file["filename"] for file in files]
+          has_code = any(path.startswith("src/") or path == "build.ps1" for path in changed_paths)
+
+          review_kind = "code" if has_code else "process"
+          agent_name = "cpp-pr-review" if has_code else "process-pr-review"
+
+          print(f"Changed files: {changed_paths}")
+          print(f"Review kind: {review_kind}")
+          print(f"Agent name: {agent_name}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"review_kind={review_kind}\n")
+              fh.write(f"agent_name={agent_name}\n")
+          PYEOF
+
+      - name: Check review round count
+        id: check_rounds
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          GITHUB_API = "https://api.github.com"
+          MAX_ROUNDS = 7
+
+          token = os.environ["GITHUB_TOKEN"]
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+
+          def gh_get_paged(path):
+              results = []
+              page = 1
+              while True:
+                  sep = "&" if "?" in path else "?"
+                  req = urllib.request.Request(
+                      f"{GITHUB_API}{path}{sep}per_page=100&page={page}",
+                      headers={
+                          "Authorization": f"Bearer {token}",
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                      },
+                  )
+                  with urllib.request.urlopen(req) as response:
+                      page_data = json.loads(response.read())
+                  if not page_data:
+                      break
+                  results.extend(page_data)
+                  if len(page_data) < 100:
+                      break
+                  page += 1
+              return results
+
+          reviews = gh_get_paged(f"/repos/{repo}/pulls/{pr_number}/reviews")
+          automated_count = sum(
+              1
+              for review in reviews
+              if isinstance(review.get("body"), str)
+              and review["body"].startswith("@copilot")
+              and review.get("state") == "CHANGES_REQUESTED"
+              and review.get("user", {}).get("login") == "github-actions[bot]"
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"round_count={automated_count}\n")
+              fh.write(f"skip_review={'true' if automated_count >= MAX_ROUNDS else 'false'}\n")
+          PYEOF
+
+      - name: Post round limit message
+        if: steps.check_rounds.outputs.skip_review == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          ROUND_COUNT: ${{ steps.check_rounds.outputs.round_count }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          GITHUB_API = "https://api.github.com"
+          LIMIT_SENTINEL = "Automated review has reached the maximum of 7 review/response rounds"
+          token = os.environ["GITHUB_TOKEN"]
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+          round_count = os.environ["ROUND_COUNT"]
+
+          page = 1
+          already_posted = False
+          while True:
+              req = urllib.request.Request(
+                  f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req) as response:
+                  comments = json.loads(response.read())
+              if any(LIMIT_SENTINEL in (comment.get("body") or "") for comment in comments):
+                  already_posted = True
+                  break
+              if len(comments) < 100:
+                  break
+              page += 1
+
+          if not already_posted:
+              body = (
+                  "@copilot Automated review has reached the maximum of 7 review/response rounds "
+                  f"({round_count} automated blocking reviews posted). Human intervention is required."
+              )
+
+              payload = json.dumps({"body": body}).encode()
+              req = urllib.request.Request(
+                  f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
+                  data=payload,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req):
+                  pass
+          PYEOF
+
+      - name: Build review input
+        if: steps.check_rounds.outputs.skip_review != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          REVIEW_KIND: ${{ steps.classify_pr.outputs.review_kind }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          GITHUB_API = "https://api.github.com"
+
+          token = os.environ["GITHUB_TOKEN"]
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+          review_kind = os.environ["REVIEW_KIND"]
+
+          def gh_get(path, accept="application/vnd.github+json"):
+              req = urllib.request.Request(
+                  f"{GITHUB_API}{path}",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": accept,
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req) as response:
+                  return response.read()
+
+          pr_data = json.loads(gh_get(f"/repos/{repo}/pulls/{pr_number}"))
+          diff_raw = gh_get(f"/repos/{repo}/pulls/{pr_number}", accept="application/vnd.github.diff").decode(
+              "utf-8", errors="replace"
+          )
+
+          lines = []
+          lines.append(f"# Review Input: PR #{pr_number}")
+          lines.append("")
+          lines.append(f"- Review kind: {review_kind}")
+          lines.append(f"- Title: {pr_data.get('title', '')}")
+          lines.append(f"- Author: {pr_data.get('user', {}).get('login', '')}")
+          lines.append(f"- Base: {pr_data.get('base', {}).get('ref', '')}")
+          lines.append(f"- Head: {pr_data.get('head', {}).get('ref', '')}")
+          lines.append("")
+          lines.append("## Pull Request Description")
+          lines.append(pr_data.get("body") or "(no description)")
+          lines.append("")
+          lines.append("## Diff")
+          lines.append("```diff")
+          lines.append(diff_raw)
+          lines.append("```")
+
+          with open("review-input.md", "w", encoding="utf-8", newline="\n") as fh:
+              fh.write("\n".join(lines))
+          PYEOF
+
+      - name: Run review agent
+        if: steps.check_rounds.outputs.skip_review != 'true'
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_REVIEW_TOKEN || secrets.PERSONAL_ACCESS_TOKEN }}
+          AGENT_NAME: ${{ steps.classify_pr.outputs.agent_name }}
+          REVIEW_KIND: ${{ steps.classify_pr.outputs.review_kind }}
+        run: |
+          if [ -z "${COPILOT_GITHUB_TOKEN}" ]; then
+            echo "Missing Copilot CLI auth secret. Add COPILOT_REVIEW_TOKEN or PERSONAL_ACCESS_TOKEN with Copilot Requests permission." >&2
+            exit 1
+          fi
+
+          cat << 'EOF' > review-prompt.txt
+          Review the pull request described in `review-input.md`.
+
+          Use the repository's custom review agent selected by the workflow.
+          Read `review-input.md` first, then read any repository files needed by the selected agent.
+
+          Return JSON only with this exact shape:
+          {
+            "event": "APPROVE|COMMENT|REQUEST_CHANGES",
+            "body": "@copilot concise review summary",
+            "blocking": [
+              {"path": "relative/path", "line": 1, "body": "@copilot actionable blocking finding"}
+            ],
+            "comments": [
+              {"path": "relative/path", "line": 1, "body": "@copilot non-blocking finding"}
+            ]
+          }
+
+          Requirements:
+          - No markdown fences
+          - No prose outside the JSON
+          - Every finding must be specific and high-signal
+          - For process reviews, focus on workflow, docs, prompts, routing, auth, and contracts
+          - For code reviews, focus on repository constraints, correctness, lifecycle edges, and test adequacy
+          EOF
+
+          cat review-prompt.txt | copilot --agent="${AGENT_NAME}" -s --no-ask-user --add-dir="$PWD" > review-output.txt
+
+      - name: Post GitHub review
+        if: steps.check_rounds.outputs.skip_review != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          GITHUB_API = "https://api.github.com"
+          FALLBACK_REVIEW = {
+              "event": "REQUEST_CHANGES",
+              "body": "@copilot Automated review could not parse structured output. Manual inspection required.",
+              "blocking": [],
+              "comments": [],
+          }
+
+          def parse_review(text):
+              cleaned = text.replace("\r", "").lstrip("\ufeff")
+              cleaned = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", cleaned).strip()
+              if cleaned.startswith("```"):
+                  lines = cleaned.splitlines()
+                  if len(lines) >= 3:
+                      cleaned = "\n".join(lines[1:-1]).strip()
+              try:
+                  parsed = json.loads(cleaned)
+              except json.JSONDecodeError:
+                  start = cleaned.find("{")
+                  end = cleaned.rfind("}")
+                  if start >= 0 and end > start:
+                      try:
+                          parsed = json.loads(cleaned[start : end + 1])
+                      except json.JSONDecodeError:
+                          return dict(FALLBACK_REVIEW)
+                  else:
+                      return dict(FALLBACK_REVIEW)
+
+              if not isinstance(parsed, dict):
+                  return dict(FALLBACK_REVIEW)
+              if not isinstance(parsed.get("event"), str):
+                  return dict(FALLBACK_REVIEW)
+              if parsed["event"] not in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
+                  return dict(FALLBACK_REVIEW)
+
+              for key in ("blocking", "comments"):
+                  if key not in parsed or not isinstance(parsed[key], list):
+                      return dict(FALLBACK_REVIEW)
+                  for entry in parsed[key]:
+                      if not isinstance(entry, dict):
+                          return dict(FALLBACK_REVIEW)
+                      for required_key in ("path", "line", "body"):
+                          if required_key not in entry:
+                              return dict(FALLBACK_REVIEW)
+                      try:
+                          line_val = int(entry["line"])
+                      except (ValueError, TypeError):
+                          return dict(FALLBACK_REVIEW)
+                      if line_val <= 0:
+                          return dict(FALLBACK_REVIEW)
+              return parsed
+
+          def render_items(title, items):
+              if not items:
+                  return ""
+              lines = [f"### {title}"]
+              for item in items:
+                  lines.append(f"- `{item['path']}:{item['line']}` {item['body']}")
+              return "\n".join(lines)
+
+          token = os.environ["GITHUB_TOKEN"]
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+
+          raw_output = open("review-output.txt", encoding="utf-8").read()
+          review = parse_review(raw_output)
+
+          sections = [review["body"].strip()]
+          blocking_section = render_items("Blocking Findings", review["blocking"])
+          comments_section = render_items("Additional Comments", review["comments"])
+          if blocking_section:
+              sections.append(blocking_section)
+          if comments_section:
+              sections.append(comments_section)
+          body = "\n\n".join(section for section in sections if section)
+
+          payload = json.dumps({"event": review["event"], "body": body}).encode()
+          req = urllib.request.Request(
+              f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(req):
+              pass
+          PYEOF

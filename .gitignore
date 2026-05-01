@@ -1,0 +1,10 @@
+.vs/
+build/
+*.obj
+*.exe
+*.ilk
+*.pdb
+*.idb
+*.tlog
+*.log
+Thumbs.db
