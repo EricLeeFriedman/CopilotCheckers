@@ -9,6 +9,7 @@ CopilotCheckers is a Windows-only checkers project being built with an **agent-f
 - Local two-player mouse interaction on one machine
 - Click-and-drag piece movement
 - Game restart after a winner is decided
+- American checkers (English draughts) rules — see `docs/requirements.md` for the full ruleset
 
 ## Engineering Constraints
 
